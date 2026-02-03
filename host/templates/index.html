@@ -3145,14 +3145,61 @@
                 }
             }
 
+            // Balance polling interval reference
+            let balanceInterval = null;
+
+            // === AUTO-SYNC USAGE FROM MODAL VOLUME ===
+            async function syncUsageFromVolume(silentMode = false) {
+                const currentProfile = document.getElementById('current-profile-name').textContent.trim();
+                if (!currentProfile || currentProfile === '...' || currentProfile.includes('Loading')) {
+                    console.log('[Sync] Skipped - profile not ready');
+                    return null;
+                }
+                
+                console.log(`[Sync] Syncing usage for ${currentProfile}...`);
+                
+                try {
+                    const res = await fetch('/sync-usage', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        credentials: 'include',
+                        body: JSON.stringify({
+                            account_name: currentProfile,
+                            volume_name: 'jekverse-comfy-models'
+                        })
+                    });
+                    
+                    if (!res.ok) {
+                        console.error(`[Sync] HTTP Error: ${res.status} ${res.statusText}`);
+                        return null;
+                    }
+                    
+                    const data = await res.json();
+                    console.log('[Sync] Response:', data);
+                    
+                    if (data.synced && data.cost_deducted > 0) {
+                        console.log(`[Sync] ✅ Deducted $${data.cost_deducted.toFixed(4)} from ${currentProfile}, new balance: $${data.new_balance}`);
+                    } else if (data.synced) {
+                        console.log('[Sync] ✅ Synced, no new cost to deduct');
+                    }
+                    
+                    return data;
+                } catch (e) {
+                    console.error('[Sync] Error:', e);
+                    return null;
+                }
+            }
+
             function startBalancePolling() {
-                // Fetch immediately
-                fetchProfileBalance();
-                // Then poll every 5 seconds
+                // Sync immediately, then fetch balance
+                syncUsageFromVolume().then(() => fetchProfileBalance());
+                
+                // Then poll every 30 seconds with sync
                 if (balanceInterval) clearInterval(balanceInterval);
-                balanceInterval = setInterval(() => {
+                balanceInterval = setInterval(async () => {
+                    await syncUsageFromVolume(true); // silent mode
                     fetchProfileBalance(false, true); // silent mode
-                }, 5000);
+                }, 30000); // Poll every 30 seconds (not too frequent)
             }
 
             function stopBalancePolling() {
@@ -3792,13 +3839,53 @@
                  }
             }
 
+            // Calculate running balance from history
+            let runningBalance = walletData.balance || 0;
+            
+            // First pass: calculate total cost and identify completed sessions
+            totalCost = 0;
+            const completedSessionIds = new Set();
             history.forEach(entry => {
-                const start = entry.start_time || '-';
+                totalCost += parseFloat(entry.cost || entry.total_cost || 0);
+                // If any entry for this session is 'completed', the session is done
+                if (entry.status === 'completed' && entry.session_id) {
+                    completedSessionIds.add(entry.session_id);
+                }
+            });
+
+            // Re-calculate: start from balance + totalCost (what it was before all deductions)
+            // Then subtract as we go through (newest first)
+            const balanceBeforeAll = runningBalance + totalCost;
+            let balanceTracker = runningBalance; // Start from current and add back
+
+            // Track which session IDs have been displayed as "running" 
+            // Only the FIRST (newest) occurrence should glow, and ONLY if not completed
+            const displayedRunningSessionIds = new Set();
+
+            history.forEach((entry, idx) => {
+                // Format start time to be readable - use Asia/Jakarta timezone
+                let start = '-';
+                if (entry.start_time) {
+                    try {
+                        const d = new Date(entry.start_time);
+                        start = d.toLocaleString('id-ID', { 
+                            timeZone: 'Asia/Jakarta',
+                            month: 'short', 
+                            day: 'numeric', 
+                            hour: '2-digit', 
+                            minute: '2-digit',
+                            hour12: false
+                        });
+                    } catch (e) {
+                        start = entry.start_time;
+                    }
+                }
                 
-                // Verbose Duration Format
+                // Duration: use duration_sec OR total_duration_sec
                 let duration = '-';
-                if (entry.total_duration_sec) {
-                    const sec = Math.round(entry.total_duration_sec);
+                const durationSec = entry.duration_sec || entry.total_duration_sec;
+                if (durationSec) {
+                    const sec = Math.round(durationSec);
                     const h = Math.floor(sec / 3600);
                     const m = Math.floor((sec % 3600) / 60);
                     const s = sec % 60;
@@ -3809,45 +3896,57 @@
                     parts.push(`${s}s`);
                     duration = parts.join(' ');
                 }
-                const cost = parseFloat(entry.total_cost || 0).toFixed(6);
-                const balance = parseFloat(entry.final_balance || 0).toFixed(4);
+                
+                // Cost from entry.cost OR entry.total_cost
+                const entryCost = parseFloat(entry.cost || entry.total_cost || 0);
+                const cost = entryCost.toFixed(4);
+                
+                // Balance after this entry: work backwards from current
+                // Since history is reversed (newest first), idx 0 = current balance
+                // idx 1 = current + cost[0], etc.
+                const balanceAfter = balanceTracker.toFixed(4);
+                balanceTracker += entryCost; // Add back for next older entry
+                
                 let gpu = entry.gpu_type || '-';
+                
+                // Determine if this entry should show as "running"
+                // Only mark as running if: 
+                // 1. Entry status is 'running'
+                // 2. Session is NOT completed (no 'completed' entry exists for this session)
+                // 3. This is the first/newest occurrence for this session_id
+                let isActiveEntry = false;
+                if (entry.status === 'running' && entry.session_id) {
+                    const isNotCompleted = !completedSessionIds.has(entry.session_id);
+                    const isFirstOccurrence = !displayedRunningSessionIds.has(entry.session_id);
+                    if (isNotCompleted && isFirstOccurrence) {
+                        isActiveEntry = true;
+                        displayedRunningSessionIds.add(entry.session_id);
+                    }
+                }
                 
                 // Show short session ID if available
                 if (entry.session_id && entry.session_id !== 'default') {
-                    const shortSid = entry.session_id.substring(0, 6);
+                    const shortSid = entry.session_id.substring(0, 7);
                     
                     let tagClass = "bg-zinc-800 border-zinc-700 text-zinc-500";
-                    // Add Active Indicator if session is active
-                    if (activeSessionIds.has(entry.session_id)) {
-                         // Active: Emerald Glow
+                    // Active indicator ONLY for the first/newest running entry
+                    if (isActiveEntry) {
                          tagClass = "bg-emerald-500/10 border-emerald-500/50 text-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.2)] animate-pulse";
                     }
 
                     gpu += ` <span class="ml-1 text-[10px] px-1 py-0.5 rounded border font-mono transition-all ${tagClass}" title="${entry.session_id}">#${shortSid}</span>`;
                 }
 
-                totalCost += parseFloat(entry.total_cost || 0);
-
                 const tr = document.createElement('tr');
                 tr.className = 'hover:bg-zinc-800/30 transition-colors';
                 
-                // Active Session Logic
-                let rowBgClass = '';
-                let firstCellClass = 'p-3 border-b border-zinc-800/50 whitespace-nowrap'; // Default
+                // Active Session Logic - only for the first running entry
+                let firstCellClass = 'p-3 border-b border-zinc-800/50 whitespace-nowrap';
 
-                if (entry.session_id && activeSessionIds.has(entry.session_id)) {
-                    // Slight green background for active row
+                if (isActiveEntry) {
                     tr.className += ' bg-emerald-900/10';
-                    
-                    // Add Left Green Border to FIRST CELL
-                    // Use border-l-emerald-500 to ONLY color the left border
                     firstCellClass += ' border-l-2 border-l-emerald-500';
                 } else {
-                    // Align non-active rows with padding to match the border width? 
-                    // Usually 2px border shifts content. 
-                    // Ideally we add a transparent border to non-active rows to prevent shift, 
-                    // OR we just let it be. Let's try adding transparent border to all to keep alignment.
                     firstCellClass += ' border-l-2 border-l-transparent';
                 }
 
@@ -3856,7 +3955,7 @@
                     <td class="p-3 border-b border-zinc-800/50 text-zinc-400 font-bold flex items-center">${gpu}</td>
                     <td class="p-3 border-b border-zinc-800/50 text-zinc-400">${duration}</td>
                     <td class="p-3 border-b border-zinc-800/50 text-right text-emerald-400/80">-$${cost}</td>
-                    <td class="p-3 border-b border-zinc-800/50 text-right text-zinc-300">$${balance}</td>
+                    <td class="p-3 border-b border-zinc-800/50 text-right text-zinc-300">$${balanceAfter}</td>
                 `;
                 tbody.appendChild(tr);
             });

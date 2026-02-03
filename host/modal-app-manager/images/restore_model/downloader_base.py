@@ -49,20 +49,6 @@ installer_image = (
 )
 
 # --- HELPER FUNCTIONS ---
-def _start_tracker():
-    print("🔄 Starting Credit Tracker...")
-    return subprocess.Popen(["python", "/root/myPackage/client-post.py"], 
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def _stop_tracker(process):
-    if process:
-        print("🛑 Stopping Credit Tracker...")
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-
 def _prepare_directories():
     folders = [
         "checkpoints", "configs", "vae", "loras", "upscale_models", 
@@ -72,10 +58,65 @@ def _prepare_directories():
     for folder in folders:
         os.makedirs(f"{MODELS_BASE_PATH}/{folder}", exist_ok=True)
 
+def _download_file(url: str, dest_path: str, hf_token: str = None):
+    """Download a single file using huggingface_hub or requests."""
+    import requests
+    from huggingface_hub import hf_hub_download
+    
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    
+    if "huggingface.co" in url:
+        # Parse HuggingFace URL
+        # Format: https://huggingface.co/{repo}/resolve/{branch}/{filename}
+        parts = url.split("/")
+        try:
+            hf_idx = parts.index("huggingface.co")
+            repo_id = f"{parts[hf_idx+1]}/{parts[hf_idx+2]}"
+            # Find filename after 'resolve' or 'blob'
+            if "resolve" in parts:
+                filename = "/".join(parts[parts.index("resolve")+2:])
+            elif "blob" in parts:
+                filename = "/".join(parts[parts.index("blob")+2:])
+            else:
+                filename = parts[-1]
+            
+            print(f"  📥 HF download: {repo_id}/{filename}")
+            downloaded = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=os.path.dirname(dest_path),
+                token=hf_token
+            )
+            # Move to expected location if needed
+            if downloaded != dest_path:
+                import shutil
+                shutil.move(downloaded, dest_path)
+        except Exception as e:
+            print(f"  ⚠️ HF download failed, using requests: {e}")
+            _download_with_requests(url, dest_path, hf_token)
+    else:
+        _download_with_requests(url, dest_path, hf_token)
+
+def _download_with_requests(url: str, dest_path: str, token: str = None):
+    """Fallback download using requests."""
+    import requests
+    headers = {}
+    if token and "huggingface.co" in url:
+        headers["Authorization"] = f"Bearer {token}"
+    
+    print(f"  📥 Downloading: {url}")
+    response = requests.get(url, headers=headers, stream=True)
+    response.raise_for_status()
+    
+    with open(dest_path, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
 # --- THE FACTORY FUNCTION ---
 def create_downloader_app(app_name, download_list):
     """
-    Fungsi Factory Bersih (Tanpa Mount Manual)
+    Factory function to create a downloader app.
+    No external dependencies - uses huggingface_hub directly.
     """
     app = modal.App(app_name)
 
@@ -87,33 +128,36 @@ def create_downloader_app(app_name, download_list):
         serialized=True, 
     )
     def run():
-        tracker = None
-        try:
-            account_name = os.environ.get("MODAL_ACCOUNT_NAME")
-            print(f"🚀 Running Downloader: {app_name}")
-            print(f"👤 Modal account: {account_name}")
-            tracker = _start_tracker()
-            _prepare_directories()
-
-            # Tulis JSON
-            json_path = f"/root/download_{app_name}.json"
-            with open(json_path, "w") as f:
-                json.dump(download_list, f, indent=2)
-
-            print(f"⬇️ Downloading {len(download_list)} files...")
+        account_name = os.environ.get("MODAL_ACCOUNT_NAME")
+        hf_token = os.environ.get("HF_TOKEN")
+        
+        print(f"🚀 Running Downloader: {app_name}")
+        print(f"👤 Modal account: {account_name}")
+        
+        _prepare_directories()
+        
+        print(f"⬇️ Downloading {len(download_list)} files...")
+        
+        success_count = 0
+        for item in download_list:
+            url = item.get("url")
+            dest = item.get("dest") or item.get("path")
             
-            # Gunakan os.system untuk menjalankan script downloader
-            exit_code = os.system(
-                f'python -u /root/myPackage/hf_downloader.py '
-                f'--batch {json_path} --jobs 16 --token "$HF_TOKEN"'
-            )
+            if not url or not dest:
+                print(f"  ⚠️ Skipping invalid item: {item}")
+                continue
+                
+            # Ensure dest is full path
+            if not dest.startswith("/"):
+                dest = f"{MODELS_BASE_PATH}/{dest}"
             
-            if exit_code == 0: print("✨ SUCCESS!")
-            else: print("⚠️ Finished with errors.")
-
-        except Exception as e:
-            print(f"❌ Error: {e}")
-        finally:
-            _stop_tracker(tracker)
+            try:
+                _download_file(url, dest, hf_token)
+                print(f"  ✅ {os.path.basename(dest)}")
+                success_count += 1
+            except Exception as e:
+                print(f"  ❌ Failed: {dest} - {e}")
+        
+        print(f"\n✨ Downloaded {success_count}/{len(download_list)} files")
 
     return app

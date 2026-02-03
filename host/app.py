@@ -673,6 +673,158 @@ def proxy_heartbeat():
     resp_data, status_code = local_worker.process_heartbeat_logic(account_name, gpu_type, GPU_RATES, session_id)
     return jsonify(resp_data), status_code
 
+@app.route('/sync-usage', methods=['POST'])
+def sync_usage_endpoint():
+    """
+    Sync usage data from Modal Volume (new simplified approach).
+    POST { "account_name": "xxx", "volume_name": "xxx" }
+    """
+    import flask
+    if 'authenticated' not in flask.session:
+        return jsonify({"error": "Not authenticated"}), 401
+        
+    data = request.get_json(silent=True) or {}
+    account_name = data.get('account_name')
+    volume_name = data.get('volume_name', 'jekverse-comfy-models')
+    
+    if not account_name:
+        return jsonify({"error": "account_name required"}), 400
+    
+    # Sync directly (synchronous version)
+    import subprocess
+    import tempfile
+    import shutil
+    
+    try:
+        modal_bin = shutil.which('modal') or os.path.expanduser('~/.local/bin/modal')
+        remote_path = f"usage/{account_name}.json"
+        
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        # Download from volume (use --force to overwrite temp file if exists)
+        cmd = [modal_bin, 'volume', 'get', '--force', volume_name, remote_path, tmp_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            return jsonify({
+                "synced": False,
+                "message": "No usage data found (VM may not have run yet)",
+                "details": result.stderr
+            }), 200
+        
+        # Parse usage data
+        import json as json_module
+        with open(tmp_path, 'r') as f:
+            usage_data = json_module.load(f)
+        os.unlink(tmp_path)
+        
+        # Load wallet
+        wallet_file = os.path.join(os.path.dirname(__file__), 'modal-credit-tracker', f'wallet_{account_name}.json')
+        if os.path.exists(wallet_file):
+            with open(wallet_file, 'r') as f:
+                wallet = json_module.load(f)
+        else:
+            wallet = {"account": account_name, "balance": 80.0, "history": [], "synced_sessions": []}
+        
+        if 'synced_sessions' not in wallet:
+            wallet['synced_sessions'] = []
+        if 'history' not in wallet:
+            wallet['history'] = []
+        
+        # Process sessions
+        new_cost = 0
+        new_sessions = 0
+        
+        for session in usage_data.get('sessions', []):
+            session_id = session.get('session_id')
+            status = session.get('status', 'unknown')
+            cost = session.get('cost', 0)
+            
+            if status == 'completed':
+                if session_id in wallet['synced_sessions']:
+                    continue
+                
+                # BUGFIX: Remove old "running" entry if exists to prevent duplicates
+                running_idx = None
+                for i, h in enumerate(wallet.get('history', [])):
+                    if h.get('session_id') == session_id and h.get('status') == 'running':
+                        running_idx = i
+                        break
+                
+                if running_idx is not None:
+                    # Remove running entry and only count the cost difference
+                    old_cost = wallet['history'][running_idx].get('cost', 0)
+                    cost_diff = cost - old_cost
+                    new_cost += cost_diff if cost_diff > 0 else 0
+                    # Remove the old running entry
+                    wallet['history'].pop(running_idx)
+                else:
+                    # No previous running entry, count full cost
+                    new_cost += cost
+                
+                new_sessions += 1
+                wallet['history'].append({
+                    'session_id': session_id,
+                    'gpu_type': session.get('gpu_type', 'Unknown'),
+                    'start_time': session.get('start_time'),
+                    'end_time': session.get('end_time'),
+                    'duration_sec': session.get('duration_sec', 0),
+                    'cost': cost,
+                    'status': 'completed'
+                })
+                wallet['synced_sessions'].append(session_id)
+                
+            elif status == 'running':
+                # Find or create running entry
+                existing_idx = None
+                for i, h in enumerate(wallet['history']):
+                    if h.get('session_id') == session_id and h.get('status') == 'running':
+                        existing_idx = i
+                        break
+                
+                if existing_idx is not None:
+                    old_cost = wallet['history'][existing_idx].get('cost', 0)
+                    cost_diff = cost - old_cost
+                    if cost_diff > 0:
+                        new_cost += cost_diff
+                        wallet['history'][existing_idx].update({
+                            'end_time': session.get('end_time'),
+                            'duration_sec': session.get('duration_sec', 0),
+                            'cost': cost
+                        })
+                else:
+                    new_cost += cost
+                    new_sessions += 1
+                    wallet['history'].append({
+                        'session_id': session_id,
+                        'gpu_type': session.get('gpu_type', 'Unknown'),
+                        'start_time': session.get('start_time'),
+                        'end_time': session.get('end_time'),
+                        'duration_sec': session.get('duration_sec', 0),
+                        'cost': cost,
+                        'status': 'running'
+                    })
+        
+        # Update balance
+        wallet['balance'] = max(0, wallet['balance'] - new_cost)
+        
+        # Save wallet
+        os.makedirs(os.path.dirname(wallet_file), exist_ok=True)
+        with open(wallet_file, 'w') as f:
+            json_module.dump(wallet, f, indent=4)
+        
+        return jsonify({
+            "synced": True,
+            "new_sessions": new_sessions,
+            "cost_deducted": round(new_cost, 6),
+            "new_balance": round(wallet['balance'], 4),
+            "total_sessions": len(usage_data.get('sessions', []))
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @socketio.on('connect')
 def handle_connect():
     if 'authenticated' not in session:
@@ -1184,6 +1336,20 @@ def handle_get_balance(data):
         else:
              print(f"Balance check blocked: Worker {worker_id} disconnected")
              emit('exec_result', {'id': request_id, 'worker_id': worker_id, 'stdout': '', 'stderr': 'Worker not connected', 'returncode': -1})
+
+@socketio.on('sync_usage')
+def handle_sync_usage(data):
+    """
+    Sync usage data from Modal Volume (new simplified approach).
+    Reads /data/usage/{account}.json from volume and updates wallet.
+    """
+    account_name = data.get('account_name')
+    volume_name = data.get('volume_name', 'jekverse-comfy-models')  # Default volume
+    request_id = data.get('id')
+    
+    print(f"📊 Syncing usage for account: {account_name} from volume: {volume_name}")
+    local_worker.sync_usage_from_volume(account_name, volume_name, request_id)
+
 
 @socketio.on('resize')
 def handle_resize(data):

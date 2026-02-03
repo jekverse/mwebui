@@ -13,37 +13,6 @@ modal_secret = modal.Secret.from_name("my-secrets")
 # Define Volume (Auto Create)
 model_volume = modal.Volume.from_name("jekverse-comfy-models", create_if_missing=True)
 
-def setup_ssh():
-    # 1. Setup Folder
-    print("Setting up SSH...")
-    os.system("mkdir -p /run/sshd")
-    os.system("mkdir -p /root/.ssh")
-    print("Folder is created")
-    # 2. AMBIL KEY DARI ENV (Python Way)
-    ssh_key = os.environ.get("SSH_KEY")
-
-    # DEBUGGING
-    if not ssh_key:
-        print("❌ FATAL: Variable SSH_KEY kosong atau tidak ditemukan!")
-        sys.exit(1)
-    else:
-        print(f"✅ SSH_KEY ditemukan (Panjang: {len(ssh_key)} karakter)")
-        print(f"   Awal Key: {ssh_key[:20]}...")
-
-    # 3. TULIS KE FILE (Python Way)
-    with open("/root/.ssh/authorized_keys", "w") as f:
-        f.write(ssh_key.strip() + "\n")
-
-    # 4. Permission & Config (Sama seperti yang berhasil)
-    os.system("chmod 700 /root/.ssh")
-    os.system("chmod 600 /root/.ssh/authorized_keys")
-
-    # Config SSHD
-    os.system("sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config")
-    os.system("sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config")
-    
-    print("🚀 SSH Setup Selesai.")
-
 def install_comfyui():
     # Clone ComfyUI
     print("Cloning ComfyUI...")
@@ -115,7 +84,8 @@ def create_comfy_config():
     print("✅ Configuration file created:")
     print(config_content) # Print untuk memastikan formatnya benar di logs
 
-def install_myPackage():
+def install_dev_tools():
+    """Install development tools (code-server, gh cli, etc.)"""
     # Install Code Server
     print("Installing Code Server...")
     os.system('''
@@ -123,45 +93,41 @@ def install_myPackage():
     mkdir -p /root/.local/share/code-server/User && \
     echo '{"workbench.colorTheme": "Default Dark+"}' > /root/.local/share/code-server/User/settings.json
     ''')
-    # Install CloudFlare
-    os.system("wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared && chmod +x cloudflared && mv cloudflared /usr/local/bin/")
+    
     # Install GitHub CLI 
     os.system("curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg")
     os.system("chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg")
     os.system("echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null")
     os.system("apt update && apt install gh -y")
-    # Set Token 
+    
+    # Set essential tokens in bashrc
     os.system("echo \"export GH_TOKEN=$GH_TOKEN\" >> ~/.bashrc")
     os.system("echo \"export HF_TOKEN=$HF_TOKEN\" >> ~/.bashrc")
-    os.system("echo \"export CLOUDFLARED_TOKEN=$CLOUDFLARED_TOKEN\" >> ~/.bashrc")
-    os.system("echo \"export CF_CLIENT_ID=$CF_CLIENT_ID\" >> ~/.bashrc")
-    os.system("echo \"export CF_CLIENT_SECRET=$CF_CLIENT_SECRET\" >> ~/.bashrc")
-    os.system("echo \"export API_URL=$API_URL\" >> ~/.bashrc")
-    os.system("echo \"export API_KEY=$API_KEY\" >> ~/.bashrc")
+    
     # Login GitHub
     os.system("echo $GH_TOKEN | gh auth login --with-token")
     os.system("gh auth setup-git")
     os.system("git config --global user.email \"sultanmahbebas38@gmail.com\"")
     os.system("git config --global user.name \"jekverse\"")
+    
     # Install Git LFS
     os.system("apt install git-lfs -y")
     os.system("git lfs install")
-    # Install myPackage
-    #NOTE FOR YAN : DONT DELETE THIS REPO ITS FOR DOWNLOADING WITH HF & CREDIT TRACKER
-    print("Installing myPackage...")
-    os.system("git clone https://github.com/jekverse/myPackage")
-    print("myPackage installed successfully!")
+    
+    print("✅ Dev tools installed successfully!")
 
 # Definisi Image dipindahkan ke sini
 jekverse_image = (
     modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "wget", "curl", "aria2", "lsof", "libgl1", "libglib2.0-0", "parallel", "openssh-server", "procps", "ca-certificates", "neovim","ffmpeg")
+    .apt_install("git", "wget", "curl", "aria2", "lsof", "libgl1", "libglib2.0-0", "parallel", "openssh-server", "procps", "ca-certificates", "neovim", "ffmpeg")
     .uv_pip_install("huggingface-hub", "hf-transfer", "requests")
-
+    
     .run_function(install_comfyui, secrets=[modal_secret])
     .run_function(create_comfy_config) 
-    .run_function(setup_ssh, secrets=[modal_secret])
-    .run_function(install_myPackage, secrets=[modal_secret])
+    .run_function(install_dev_tools, secrets=[modal_secret])
+    
+    # Add embedded usage tracker LAST (Modal requirement)
+    .add_local_python_source("usage_tracker")
 )
 
 # Gunakan image yang sudah di-import

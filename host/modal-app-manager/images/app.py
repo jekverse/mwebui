@@ -2,6 +2,7 @@ import modal, os, textwrap
 import modal.config as config
 from base_image import jekverse_image 
 import subprocess
+import atexit
 
 # Buat 2 Volume terpisah agar tidak bentrok
 comfyui_vol = modal.Volume.from_name("jekverse-comfy-models", create_if_missing=True)
@@ -10,7 +11,7 @@ comfyui_vol = modal.Volume.from_name("jekverse-comfy-models", create_if_missing=
 app_name_env = os.environ.get("MODAL_APP_NAME", "").strip()
 app = modal.App(app_name_env if app_name_env else "Modal-App")
 
-# 2. Ambil parameter sisa (GPU, Timeout, Region, Diskkk)
+# 2. Ambil parameter sisa (GPU, Timeout, Region, Disk)
 gpu_env = os.environ.get("MODAL_GPU", "").strip()
 timeout_raw = os.environ.get("MODAL_TIMEOUT", "").strip()
 region_env = os.environ.get("MODAL_REGION", "").strip()
@@ -43,6 +44,7 @@ app_config = {
     "secrets": [
         modal.Secret.from_dict({
             "MODAL_ACCOUNT_NAME": modal_profile_name,
+            "MODAL_GPU_TYPE": gpu_env or "CPU",
         }),
         modal.Secret.from_name("my-secrets")
     ],
@@ -58,8 +60,20 @@ if disk_env: app_config["ephemeral_disk"] = int(disk_env)
         
 @app.function(**app_config)
 def run():
-    #NOTE FOR YAN : DONT DELETE THIS MESSAGE 
-    print("SERVER MODAL TELAH AKTIF!")
+    # Import embedded usage tracker (no external dependency!)
+    from usage_tracker import start_tracking, stop_tracking
+    
+    print("🚀 SERVER MODAL TELAH AKTIF!")
+    
+    # Get account and GPU from environment
+    account_name = os.environ.get("MODAL_ACCOUNT_NAME", "unknown")
+    gpu_type = os.environ.get("MODAL_GPU_TYPE", "CPU")
+    
+    # Start usage tracking (writes to /data/usage/)
+    start_tracking(account_name, gpu_type, periodic=True)
+    
+    # Register cleanup on exit
+    atexit.register(stop_tracking)
 
     # Buat folder output/user jika belum ada
     os.makedirs("/data/output", exist_ok=True)
@@ -68,6 +82,7 @@ def run():
 
     # Run SSH Server
     subprocess.Popen(["/usr/sbin/sshd", "-D"])
+    
     # Run ComfyUI 
     os.system(
         "python /root/ComfyUI/main.py "
@@ -78,7 +93,13 @@ def run():
 
     # Activate CodeServer
     os.system("code-server --auth none /root &")
-    # Run Credit Tracker
-    os.system("python /root/myPackage/client-post.py &")
-    # Activate CloudFlare
-    os.system("cloudflared tunnel run --protocol http2 --token $CLOUDFLARED_TOKEN")
+    
+    # Keep container alive (blocking call)
+    # Replace cloudflared with simple sleep loop
+    import time
+    print("✅ All services started. Container running...")
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        stop_tracking()

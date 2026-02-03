@@ -242,6 +242,185 @@ class InternalWorker:
                 'error': str(e),
                 'returncode': 1
             })
+    
+    # --- SYNC USAGE FROM VOLUME (NEW SIMPLIFIED APPROACH) ---
+    
+    GPU_RATES = {
+        "Nvidia B200": 6.75, "Nvidia H200": 5.04, "Nvidia H100": 4.45,
+        "Nvidia A100, 80 GB": 3.00, "Nvidia A100, 40 GB": 2.60,
+        "Nvidia L40S": 2.45, "Nvidia A10": 1.60, "Nvidia L4": 1.30, 
+        "Nvidia T4": 1.09, "CPU": 0.1
+    }
+    
+    def sync_usage_from_volume(self, account_name, volume_name, request_id):
+        """
+        Sync usage data from Modal Volume.
+        
+        This reads /data/usage/{account}.json from the volume and
+        updates local wallet balance based on recorded sessions.
+        """
+        if not account_name or not volume_name:
+            self.callback('exec_result', {
+                'id': request_id,
+                'stdout': '',
+                'stderr': 'Account name and volume name required',
+                'returncode': 1
+            })
+            return
+            
+        try:
+            import tempfile
+            
+            # Use modal CLI to get the file from volume
+            modal_bin = shutil.which('modal') or os.path.expanduser('~/.local/bin/modal')
+            remote_path = f"usage/{account_name}.json"
+            
+            # Create temp file for the download
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            # Download usage file from volume
+            # modal volume get <volume_name> <remote_path> <local_path>
+            cmd = [modal_bin, 'volume', 'get', volume_name, remote_path, tmp_path]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                # File might not exist yet (no sessions recorded)
+                self.callback('exec_result', {
+                    'id': request_id,
+                    'stdout': json.dumps({
+                        'synced': False,
+                        'message': 'No usage data found (VM may not have run yet)',
+                        'details': result.stderr
+                    }),
+                    'stderr': '',
+                    'returncode': 0
+                })
+                return
+            
+            # Parse usage data from volume
+            with open(tmp_path, 'r') as f:
+                usage_data = json.load(f)
+            
+            # Clean up temp file
+            os.unlink(tmp_path)
+            
+            # Load existing wallet
+            wallet = self._load_wallet_data(account_name)
+            
+            # Track which sessions we've already processed
+            if 'synced_sessions' not in wallet:
+                wallet['synced_sessions'] = []
+            
+            # Process each session from usage data
+            new_cost = 0
+            new_sessions = 0
+            
+            for session in usage_data.get('sessions', []):
+                session_id = session.get('session_id')
+                status = session.get('status', 'unknown')
+                cost = session.get('cost', 0)
+                
+                # For completed sessions: only process if not already synced
+                if status == 'completed':
+                    if session_id in wallet['synced_sessions']:
+                        continue
+                    
+                    # BUGFIX: Remove old "running" entry if exists to prevent duplicates
+                    running_idx = None
+                    for i, h in enumerate(wallet.get('history', [])):
+                        if h.get('session_id') == session_id and h.get('status') == 'running':
+                            running_idx = i
+                            break
+                    
+                    if running_idx is not None:
+                        # Remove running entry and only count the cost difference
+                        old_cost = wallet['history'][running_idx].get('cost', 0)
+                        cost_diff = cost - old_cost
+                        new_cost += cost_diff if cost_diff > 0 else 0
+                        # Remove the old running entry
+                        wallet['history'].pop(running_idx)
+                    else:
+                        # No previous running entry, count full cost
+                        new_cost += cost
+                    
+                    new_sessions += 1
+                    
+                    # Add completed entry to history
+                    wallet['history'].append({
+                        'session_id': session_id,
+                        'gpu_type': session.get('gpu_type', 'Unknown'),
+                        'start_time': session.get('start_time'),
+                        'end_time': session.get('end_time'),
+                        'duration_sec': session.get('duration_sec', 0),
+                        'cost': cost,
+                        'source': 'volume_sync',
+                        'status': 'completed'
+                    })
+                    
+                    # Mark as synced
+                    wallet['synced_sessions'].append(session_id)
+                    
+                # For running sessions: update or create tracking entry
+                elif status == 'running':
+                    # Find existing running entry to update
+                    existing_idx = None
+                    for i, h in enumerate(wallet.get('history', [])):
+                        if h.get('session_id') == session_id and h.get('status') == 'running':
+                            existing_idx = i
+                            break
+                    
+                    if existing_idx is not None:
+                        # Update existing running entry
+                        old_cost = wallet['history'][existing_idx].get('cost', 0)
+                        cost_diff = cost - old_cost
+                        if cost_diff > 0:
+                            new_cost += cost_diff
+                            wallet['history'][existing_idx].update({
+                                'end_time': session.get('end_time'),
+                                'duration_sec': session.get('duration_sec', 0),
+                                'cost': cost
+                            })
+                    else:
+                        # New running session
+                        new_cost += cost
+                        new_sessions += 1
+                        wallet['history'].append({
+                            'session_id': session_id,
+                            'gpu_type': session.get('gpu_type', 'Unknown'),
+                            'start_time': session.get('start_time'),
+                            'end_time': session.get('end_time'),
+                            'duration_sec': session.get('duration_sec', 0),
+                            'cost': cost,
+                            'source': 'volume_sync',
+                            'status': 'running'
+                        })
+            
+            # Deduct total cost from balance
+            wallet['balance'] = max(0, wallet['balance'] - new_cost)
+            
+            # Save updated wallet
+            self._save_wallet_data(account_name, wallet)
+            
+            self.callback('exec_result', {
+                'id': request_id,
+                'stdout': json.dumps({
+                    'synced': True,
+                    'new_sessions': new_sessions,
+                    'cost_deducted': round(new_cost, 6),
+                    'new_balance': round(wallet['balance'], 4)
+                }),
+                'stderr': '',
+                'returncode': 0
+            })
+            
+        except Exception as e:
+            self.callback('exec_result', {
+                'id': request_id,
+                'stdout': '',
+                'stderr': str(e),
+                'returncode': 1
+            })
             
     # --- HELPER FOR HEARTBEAT (CALLED FROM HOST ROUTE) ---
     
