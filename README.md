@@ -28,6 +28,11 @@ A Flask-based web application for centrally managing and monitoring Modal worker
 - Auto-generate scripts for restoring models from Hugging Face
 - Diff directory configuration via dropdown
 
+### 💻 Cross-Platform Support
+- ✅ Linux (native)
+- ✅ Windows (with alternatives - see [WINDOWS.md](WINDOWS.md))
+- ✅ macOS (compatible)
+
 ---
 
 ## 🚀 Quick Start
